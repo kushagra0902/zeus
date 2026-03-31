@@ -102,6 +102,7 @@ import UnitsStore from '../../stores/UnitsStore';
 import UTXOsStore from '../../stores/UTXOsStore';
 import ContactStore from '../../stores/ContactStore';
 import NotesStore from '../../stores/NotesStore';
+import PaymentListenerStore from '../../stores/PaymentListenerStore';
 import SwapStore from '../../stores/SwapStore';
 import NostrWalletConnectStore from '../../stores/NostrWalletConnectStore';
 
@@ -143,6 +144,7 @@ interface WalletProps {
     LightningAddressStore: LightningAddressStore;
     LnurlPayStore: LnurlPayStore;
     NostrWalletConnectStore: NostrWalletConnectStore;
+    PaymentListenerStore: PaymentListenerStore;
 }
 
 interface WalletState {
@@ -174,7 +176,8 @@ interface WalletState {
     'LightningAddressStore',
     'NotesStore',
     'SwapStore',
-    'NostrWalletConnectStore'
+    'NostrWalletConnectStore',
+    'PaymentListenerStore'
 )
 @observer
 export default class Wallet extends React.Component<WalletProps, WalletState> {
@@ -526,6 +529,7 @@ export default class Wallet extends React.Component<WalletProps, WalletState> {
             LightningAddressStore.reset();
             LSPStore.reset();
             ChannelBackupStore.reset();
+            this.props.PaymentListenerStore.stopListening();
             UTXOsStore.reset();
             ContactStore.loadContacts();
             NotesStore.loadNoteKeys();
@@ -964,12 +968,16 @@ export default class Wallet extends React.Component<WalletProps, WalletState> {
                                 .automaticDisasterRecoveryBackup
                         )
                             ChannelBackupStore.initSubscribeChannelEvents();
+                        // Start global payment listener
+                        this.props.PaymentListenerStore.startListening();
                     } catch (recoverError) {
                         console.error('recover error', recoverError);
                     }
                 } else {
                     if (SettingsStore.settings.automaticDisasterRecoveryBackup)
                         ChannelBackupStore.initSubscribeChannelEvents();
+                    // Start global payment listener
+                    this.props.PaymentListenerStore.startListening();
                 }
             } catch (rpcError: any) {
                 const errorMessage = rpcError?.message ?? '';
@@ -1161,6 +1169,9 @@ export default class Wallet extends React.Component<WalletProps, WalletState> {
             );
             setConnectingStatus(false);
             SettingsStore.setInitialStart(false);
+
+            // Start global payment listener for non-embedded backends
+            this.props.PaymentListenerStore.startListening();
 
             if (this.startupTimeoutId) {
                 clearTimeout(this.startupTimeoutId);

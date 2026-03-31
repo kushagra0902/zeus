@@ -33,6 +33,7 @@ import {
     nodeInfoStore,
     notesStore,
     offersStore,
+    paymentListenerStore,
     paymentsStore,
     posStore,
     settingsStore,
@@ -403,6 +404,7 @@ export default class App extends React.PureComponent {
                 NodeInfoStore={nodeInfoStore}
                 NotesStore={notesStore}
                 OffersStore={offersStore}
+                PaymentListenerStore={paymentListenerStore}
                 PaymentsStore={paymentsStore}
                 PosStore={posStore}
                 SettingsStore={settingsStore}

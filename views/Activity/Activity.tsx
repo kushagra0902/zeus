@@ -1,4 +1,5 @@
 import * as React from 'react';
+import { reaction, IReactionDisposer } from 'mobx';
 import {
     FlatList,
     NativeModules,
@@ -37,6 +38,8 @@ import ActivityStore, { DEFAULT_FILTERS } from '../../stores/ActivityStore';
 import FiatStore from '../../stores/FiatStore';
 import PosStore from '../../stores/PosStore';
 import SettingsStore from '../../stores/SettingsStore';
+import InvoicesStore from '../../stores/InvoicesStore';
+import PaymentListenerStore from '../../stores/PaymentListenerStore';
 import SwapStore from '../../stores/SwapStore';
 
 import Filter from '../../assets/images/SVG/Filter On.svg';
@@ -56,7 +59,9 @@ interface ActivityProps {
     FiatStore: FiatStore;
     PosStore: PosStore;
     SettingsStore: SettingsStore;
+    InvoicesStore: InvoicesStore;
     SwapStore: SwapStore;
+    PaymentListenerStore: PaymentListenerStore;
     route: Route<'Activity', { order: any }>;
 }
 
@@ -450,15 +455,17 @@ const ActivityListItem = observer(
     'PosStore',
     'SettingsStore',
     'InvoicesStore',
-    'SwapStore'
+    'SwapStore',
+    'PaymentListenerStore'
 )
 @observer
 export default class Activity extends React.PureComponent<
     ActivityProps,
     ActivityState
 > {
-    private transactionListener: EmitterSubscription;
-    private invoicesListener: EmitterSubscription;
+    private paymentReactionDisposer: IReactionDisposer | null = null;
+    private transactionListener: EmitterSubscription | null = null;
+    private invoicesListener: EmitterSubscription | null = null;
     private focusListener?: () => void;
 
     state = {
@@ -481,6 +488,18 @@ export default class Activity extends React.PureComponent<
         if (SettingsStore.implementation === 'lightning-node-connect') {
             this.subscribeEvents();
         }
+
+        // React to any incoming payment detected by PaymentListenerStore
+        const { PaymentListenerStore } = this.props;
+        this.paymentReactionDisposer = reaction(
+            () => PaymentListenerStore.lastSettledInvoice,
+            () => {
+                // Refresh activity when a payment arrives
+                this.props.ActivityStore.updateInvoices(
+                    SettingsStore.settings.locale
+                );
+            }
+        );
 
         this.focusListener = navigation.addListener('focus', async () => {
             const refilters = await getFilters();
@@ -507,6 +526,10 @@ export default class Activity extends React.PureComponent<
     }
 
     componentWillUnmount() {
+        if (this.paymentReactionDisposer) {
+            this.paymentReactionDisposer();
+            this.paymentReactionDisposer = null;
+        }
         if (this.transactionListener) this.transactionListener.remove();
         if (this.invoicesListener) this.invoicesListener.remove();
         if (this.focusListener) this.focusListener();
