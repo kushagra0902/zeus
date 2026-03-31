@@ -19,6 +19,7 @@ import NodeInfoStore from './NodeInfoStore';
 import NotesStore from './NotesStore';
 import OffersStore from './OffersStore';
 import PaymentsStore from './PaymentsStore';
+import PaymentListenerStore from './PaymentListenerStore';
 import PosStore from './PosStore';
 import SettingsStore from './SettingsStore';
 import SwapStore from './SwapStore';
@@ -84,6 +85,12 @@ export const activityStore = new ActivityStore(
     cashuStore,
     swapStore,
     nodeInfoStore
+);
+export const paymentListenerStore = new PaymentListenerStore(
+    settingsStore,
+    balanceStore,
+    channelsStore,
+    activityStore
 );
 export const lightningAddressStore = new LightningAddressStore(
     cashuStore,
