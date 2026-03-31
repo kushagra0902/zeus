@@ -1,8 +1,7 @@
 import * as React from 'react';
+import { reaction, IReactionDisposer } from 'mobx';
 import {
     Dimensions,
-    NativeEventEmitter,
-    NativeModules,
     ScrollView,
     StyleSheet,
     TouchableOpacity,
@@ -59,7 +58,6 @@ import Text from '../components/Text';
 import TextInput from '../components/TextInput';
 import { Spacer } from '../components/layout/Spacer';
 
-import Invoice from '../models/Invoice';
 import Channel from '../models/Channel';
 
 import ChannelsStore from '../stores/ChannelsStore';
@@ -75,10 +73,10 @@ import LightningAddressStore from '../stores/LightningAddressStore';
 import LSPStore from '../stores/LSPStore';
 import UnitsStore from '../stores/UnitsStore';
 import BalanceStore from '../stores/BalanceStore';
+import PaymentListenerStore from '../stores/PaymentListenerStore';
 
 import { localeString } from '../utils/LocaleUtils';
 import BackendUtils from '../utils/BackendUtils';
-import Base64Utils from '../utils/Base64Utils';
 import NFCUtils from '../utils/NFCUtils';
 import { themeColor } from '../utils/ThemeUtils';
 import { SATS_PER_BTC } from '../utils/UnitsUtils';
@@ -89,13 +87,6 @@ import {
     expirationIndexFromSeconds,
     expirySecondsFromInput
 } from '../utils/ExpiryUtils';
-
-import lndMobile from '../lndmobile/LndMobileInjection';
-import { decodeSubscribeTransactionsResult } from '../lndmobile/onchain';
-import {
-    checkLndStreamErrorResponse,
-    LndMobileEventEmitter
-} from '../utils/LndMobileUtils';
 
 import CaretDown from '../assets/images/SVG/Caret Down.svg';
 import CaretRight from '../assets/images/SVG/Caret Right.svg';
@@ -120,6 +111,7 @@ interface ReceiveProps {
     LSPStore: LSPStore;
     LightningAddressStore: LightningAddressStore;
     BalanceStore: BalanceStore;
+    PaymentListenerStore: PaymentListenerStore;
     route: Route<
         'Receive',
         {
@@ -199,7 +191,8 @@ const LOCKED_EXPIRY_SECONDS = '3600';
     'NodeInfoStore',
     'LightningAddressStore',
     'LSPStore',
-    'BalanceStore'
+    'BalanceStore',
+    'PaymentListenerStore'
 )
 @observer
 export default class Receive extends React.Component<
@@ -250,6 +243,8 @@ export default class Receive extends React.Component<
     lnInterval: any;
     onChainInterval: any;
     hopPickerRef: HopPicker | null;
+    private invoiceReactionDisposer: IReactionDisposer | null = null;
+    private txReactionDisposer: IReactionDisposer | null = null;
 
     private getDefaultIndex = (): number => {
         const { settings } = this.props.SettingsStore;
@@ -532,6 +527,16 @@ export default class Receive extends React.Component<
             this.listenerSecondary.stop();
         this.clearIntervals();
 
+        // dispose MobX reactions
+        if (this.invoiceReactionDisposer) {
+            this.invoiceReactionDisposer();
+            this.invoiceReactionDisposer = null;
+        }
+        if (this.txReactionDisposer) {
+            this.txReactionDisposer();
+            this.txReactionDisposer = null;
+        }
+
         // clear invoice
         this.props.InvoicesStore.reset();
     };
@@ -796,8 +801,7 @@ export default class Receive extends React.Component<
             PosStore,
             SettingsStore,
             NodeInfoStore,
-            BalanceStore,
-            ChannelsStore
+            PaymentListenerStore // Injected PaymentListenerStore
         } = this.props;
         const { orderId, orderTotal, orderTip, exchangeRate, rate, value } =
             this.state;
@@ -810,256 +814,22 @@ export default class Receive extends React.Component<
                 ? 1
                 : 0;
 
-        if (implementation === 'embedded-lnd') {
-            if (rHash) {
-                this.listener = LndMobileEventEmitter.addListener(
-                    'SubscribeInvoices',
-                    (e: any) => {
-                        try {
-                            const error = checkLndStreamErrorResponse(
-                                'SubscribeInvoices',
-                                e
-                            );
-                            if (error === 'EOF') {
-                                this.listener?.remove();
-                                return;
-                            } else if (error) {
-                                console.error(
-                                    'Got error from SubscribeInvoices',
-                                    [error]
-                                );
-                                this.listener?.remove();
-                                return;
-                            }
-
-                            const invoice =
-                                lndMobile.wallet.decodeInvoiceResult(e.data);
-
-                            if (
-                                invoice.settled &&
-                                // @ts-ignore:next-line
-                                Base64Utils.bytesToHex(invoice.r_hash) === rHash
-                            ) {
-                                setWatchedInvoicePaid(
-                                    Number(invoice.amt_paid_sat)
-                                );
-                                BalanceStore.getCombinedBalance();
-                                ChannelsStore.getChannels();
-
-                                if (orderId) {
-                                    PosStore.recordPayment({
-                                        orderId,
-                                        orderTotal,
-                                        orderTip,
-                                        exchangeRate,
-                                        rate,
-                                        type: 'ln',
-                                        tx: invoice.payment_request,
-                                        preimage: Base64Utils.bytesToHex(
-                                            // @ts-ignore:next-line
-                                            invoice.r_preimage
-                                        )
-                                    });
-                                    // Clear stored invoice after successful payment
-                                    PosStore.clearOrderInvoice(orderId);
-                                }
-                                this.listener?.remove();
-                            }
-                        } catch (error) {
-                            console.error(error);
-                            this.listener?.remove();
-                        }
-                    }
-                );
-            }
-
-            if (onChainAddress) {
-                this.listenerSecondary = LndMobileEventEmitter.addListener(
-                    'SubscribeTransactions',
-                    (e: any) => {
-                        try {
-                            const error = checkLndStreamErrorResponse(
-                                'SubscribeTransactions',
-                                e
-                            );
-                            if (error === 'EOF') {
-                                this.listenerSecondary?.remove();
-                                return;
-                            } else if (error) {
-                                console.error(
-                                    'Got error from SubscribeTransactions',
-                                    [error]
-                                );
-                                this.listenerSecondary?.remove();
-                                return;
-                            }
-
-                            const transaction =
-                                decodeSubscribeTransactionsResult(e.data);
-                            if (
-                                onChainAddress &&
-                                transaction.dest_addresses.includes(
-                                    onChainAddress
-                                ) &&
-                                transaction.num_confirmations >
-                                    numConfPreference &&
-                                Number(transaction.amount) >= Number(value)
-                            ) {
-                                setWatchedInvoicePaid(
-                                    Number(transaction.amount)
-                                );
-                                BalanceStore.getCombinedBalance();
-
-                                if (orderId) {
-                                    PosStore.recordPayment({
-                                        orderId,
-                                        orderTotal,
-                                        orderTip,
-                                        exchangeRate,
-                                        rate,
-                                        type: 'onchain',
-                                        tx: transaction.tx_hash
-                                    });
-                                    // Clear stored invoice after successful payment
-                                    PosStore.clearOrderInvoice(orderId);
-                                }
-                                this.listenerSecondary?.remove();
-                            }
-                        } catch (error) {
-                            console.error(error);
-                            this.listenerSecondary?.remove();
-                        }
-                    }
-                );
-            }
-
-            await lndMobile.wallet.subscribeInvoices();
-            await lndMobile.onchain.subscribeTransactions();
-        }
-
-        if (implementation === 'lightning-node-connect') {
-            const { LncModule } = NativeModules;
-            if (rHash) {
-                const eventName = BackendUtils.subscribeInvoice(rHash);
-                const eventEmitter = new NativeEventEmitter(LncModule);
-                this.listener = eventEmitter.addListener(
-                    eventName,
-                    (event: any) => {
-                        if (event.result) {
-                            if (
-                                typeof event.result === 'string' &&
-                                event.result.includes(
-                                    'rpc error: code = Canceled'
-                                )
-                            ) {
-                                this.listener?.remove();
-                                return;
-                            }
-                            try {
-                                const result = JSON.parse(event.result);
-                                if (result === 'EOF') {
-                                    this.listener?.remove();
-                                    return;
-                                }
-                                if (result.settled) {
-                                    setWatchedInvoicePaid(result.amt_paid_sat);
-                                    BalanceStore.getCombinedBalance();
-                                    ChannelsStore.getChannels();
-
-                                    if (orderId) {
-                                        PosStore.recordPayment({
-                                            orderId,
-                                            orderTotal,
-                                            orderTip,
-                                            exchangeRate,
-                                            rate,
-                                            type: 'ln',
-                                            tx: result.payment_request,
-                                            preimage: result.r_preimage
-                                        });
-                                        // Clear stored invoice after successful payment
-                                        PosStore.clearOrderInvoice(orderId);
-                                    }
-                                    this.listener?.remove();
-                                }
-                            } catch (error) {
-                                console.error(error);
-                                this.listener?.remove();
-                            }
-                        }
-                    }
-                );
-            }
-
-            if (onChainAddress) {
-                const eventName2 = BackendUtils.subscribeTransactions();
-                const eventEmitter2 = new NativeEventEmitter(LncModule);
-                this.listenerSecondary = eventEmitter2.addListener(
-                    eventName2,
-                    (event: any) => {
-                        if (event.result) {
-                            if (
-                                typeof event.result === 'string' &&
-                                event.result.includes(
-                                    'rpc error: code = Canceled'
-                                )
-                            ) {
-                                this.listenerSecondary?.remove();
-                                return;
-                            }
-                            try {
-                                const result = JSON.parse(event.result);
-                                if (result === 'EOF') {
-                                    this.listenerSecondary?.remove();
-                                    return;
-                                }
-                                if (
-                                    result.dest_addresses.includes(
-                                        onChainAddress
-                                    ) &&
-                                    result.num_confirmations >=
-                                        numConfPreference &&
-                                    Number(result.amount) >= Number(value)
-                                ) {
-                                    setWatchedInvoicePaid(result.amount);
-                                    BalanceStore.getCombinedBalance();
-
-                                    if (orderId) {
-                                        PosStore.recordPayment({
-                                            orderId,
-                                            orderTotal,
-                                            orderTip,
-                                            exchangeRate,
-                                            rate,
-                                            type: 'onchain',
-                                            tx: result.tx_hash
-                                        });
-                                        // Clear stored invoice after successful payment
-                                        PosStore.clearOrderInvoice(orderId);
-                                    }
-                                    this.listenerSecondary?.remove();
-                                }
-                            } catch (error) {
-                                console.error(error);
-                                this.listenerSecondary?.remove();
-                            }
-                        }
-                    }
-                );
-            }
-        }
-
-        if (implementation === 'ldk-node') {
-            const ldkBackend = BackendUtils.ldkNode;
-
-            this.ldkUnsubscribe = ldkBackend.subscribeToEvents((event) => {
-                if (event.type === 'paymentReceived') {
-                    const amountSat = Math.floor(event.amountMsat / 1000);
-
-                    // Check if this is the invoice we're watching
-                    if (rHash && event.paymentHash === rHash) {
-                        setWatchedInvoicePaid(amountSat);
-                        BalanceStore.getCombinedBalance();
+        // React to globally-detected LN invoice settlements
+        if (rHash) {
+            this.invoiceReactionDisposer = reaction(
+                () => PaymentListenerStore.lastSettledInvoice,
+                (settledInvoice) => {
+                    if (!settledInvoice) return;
+                    // Match by r_hash
+                    const settledHash = settledInvoice.r_hash || '';
+                    // Normalize: replace URL-safe base64 chars for comparison
+                    const normalizedHash = settledHash
+                        .replace(/\+/g, '-')
+                        .replace(/\//g, '_');
+                    if (settledHash === rHash || normalizedHash === rHash) {
+                        setWatchedInvoicePaid(
+                            Number(settledInvoice.amt_paid_sat)
+                        );
 
                         if (orderId) {
                             PosStore.recordPayment({
@@ -1069,64 +839,59 @@ export default class Receive extends React.Component<
                                 exchangeRate,
                                 rate,
                                 type: 'ln',
-                                tx: event.paymentHash
+                                tx: settledInvoice.payment_request,
+                                preimage: settledInvoice.r_preimage
                             });
                             PosStore.clearOrderInvoice(orderId);
                         }
 
-                        if (this.ldkUnsubscribe) {
-                            this.ldkUnsubscribe();
-                            this.ldkUnsubscribe = null;
+                        if (this.invoiceReactionDisposer) {
+                            this.invoiceReactionDisposer();
+                            this.invoiceReactionDisposer = null;
                         }
                     }
                 }
-            });
+            );
         }
 
-        if (implementation === 'lnd') {
-            if (rHash) {
-                this.lnInterval = setInterval(() => {
-                    // only fetch the last 10 invoices
-                    BackendUtils.getInvoices({ limit: 10 }).then(
-                        (response: any) => {
-                            const invoices = response.invoices;
-                            for (let i = 0; i < invoices.length; i++) {
-                                const result = invoices[i];
-                                if (
-                                    result.r_hash
-                                        .replace(/\+/g, '-')
-                                        .replace(/\//g, '_') === rHash &&
-                                    Number(result.amt_paid_sat) >=
-                                        Number(value) &&
-                                    Number(result.amt_paid_sat) !== 0
-                                ) {
-                                    setWatchedInvoicePaid(result.amt_paid_sat);
-                                    BalanceStore.getCombinedBalance();
-                                    ChannelsStore.getChannels();
+        if (onChainAddress) {
+            this.txReactionDisposer = reaction(
+                () => PaymentListenerStore.lastOnChainTx,
+                (tx) => {
+                    if (!tx) return;
+                    if (
+                        tx.dest_addresses &&
+                        tx.dest_addresses.includes(onChainAddress) &&
+                        tx.num_confirmations >= numConfPreference &&
+                        Number(tx.amount) >= Number(value)
+                    ) {
+                        setWatchedInvoicePaid(Number(tx.amount));
 
-                                    if (orderId) {
-                                        PosStore.recordPayment({
-                                            orderId,
-                                            orderTotal,
-                                            orderTip,
-                                            exchangeRate,
-                                            rate,
-                                            type: 'ln',
-                                            tx: result.payment_request
-                                        });
-                                        // Clear stored invoice after successful payment
-                                        PosStore.clearOrderInvoice(orderId);
-                                    }
-                                    this.clearIntervals();
-                                    break;
-                                }
-                            }
+                        if (orderId) {
+                            PosStore.recordPayment({
+                                orderId,
+                                orderTotal,
+                                orderTip,
+                                exchangeRate,
+                                rate,
+                                type: 'onchain',
+                                tx: tx.tx_hash
+                            });
+                            PosStore.clearOrderInvoice(orderId);
                         }
-                    );
-                }, 5000);
-            }
 
-            // this is workaround that manually calls your transactions every 30 secs
+                        // Clean up this reaction after match
+                        if (this.txReactionDisposer) {
+                            this.txReactionDisposer();
+                            this.txReactionDisposer = null;
+                        }
+                    }
+                }
+            );
+        }
+
+        // Specifically for LND REST, since PaymentListenerStore doesn't poll onchain transactions
+        if (implementation === 'lnd') {
             if (onChainAddress) {
                 this.onChainInterval = setInterval(() => {
                     // only look for transactions in the last 3 blocks
@@ -1136,138 +901,62 @@ export default class Receive extends React.Component<
                                   start_height: nodeInfo.block_height - 3
                               }
                             : null
-                    ).then((response: any) => {
-                        const txs = response.transactions;
-                        for (let i = 0; i < txs.length; i++) {
-                            const result = txs[i];
-                            if (
-                                result.dest_addresses.includes(
-                                    onChainAddress
-                                ) &&
-                                result.num_confirmations >= numConfPreference
-                            ) {
-                                // loop through outputs since amount is negative if unconfirmed
-                                const output_details = result.output_details;
-                                for (
-                                    let j = 0;
-                                    j < output_details.length;
-                                    j++
-                                ) {
-                                    const output = output_details[j];
-                                    if (
-                                        Number(output.amount) >=
-                                            Number(value) &&
-                                        output.address === onChainAddress
-                                    ) {
-                                        setWatchedInvoicePaid(output.amount);
-                                        BalanceStore.getCombinedBalance();
-
-                                        if (orderId) {
-                                            PosStore.recordPayment({
-                                                orderId,
-                                                orderTotal,
-                                                orderTip,
-                                                exchangeRate,
-                                                rate,
-                                                type: 'onchain',
-                                                tx: result.tx_hash
-                                            });
-                                            // Clear stored invoice after successful payment
-                                            PosStore.clearOrderInvoice(orderId);
-                                        }
-                                        this.clearIntervals();
-                                        // break parent loop
-                                        i = txs.length;
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    });
-                }, 7000);
-            }
-        }
-
-        if (implementation === 'cln-rest') {
-            if (rHash) {
-                this.lnInterval = setInterval(() => {
-                    // only fetch the last 10 invoices
-                    BackendUtils.getInvoices({ limit: 10 }).then(
-                        (response: any) => {
-                            const invoices = response.invoices;
-                            for (let i = 0; i < invoices.length; i++) {
-                                const result = invoices[i];
+                    )
+                        .then((response: any) => {
+                            const txs = response.transactions;
+                            for (let i = 0; i < txs.length; i++) {
+                                const result = txs[i];
                                 if (
-                                    result.payment_hash
-                                        .replace(/\+/g, '-')
-                                        .replace(/\//g, '_') === rHash &&
-                                    Number(
-                                        result.amount_received_msat / 1000
-                                    ) >= Number(value) &&
-                                    Number(result.amount_received_msat) !== 0
+                                    result.dest_addresses.includes(
+                                        onChainAddress
+                                    ) &&
+                                    result.num_confirmations >=
+                                        numConfPreference
                                 ) {
-                                    setWatchedInvoicePaid(
-                                        result.amount_received_msat / 1000
-                                    );
-                                    BalanceStore.getCombinedBalance();
-                                    ChannelsStore.getChannels();
-                                    if (orderId) {
-                                        PosStore.recordPayment({
-                                            orderId,
-                                            orderTotal,
-                                            orderTip,
-                                            exchangeRate,
-                                            rate,
-                                            type: 'ln',
-                                            tx: result.bolt11
-                                        });
-                                        // Clear stored invoice after successful payment
-                                        PosStore.clearOrderInvoice(orderId);
-                                    }
-                                    this.clearIntervals();
-                                    break;
-                                }
-                            }
-                        }
-                    );
-                }, 5000);
-            }
-        }
+                                    // loop through outputs since amount is negative if unconfirmed
+                                    const output_details =
+                                        result.output_details || [];
+                                    for (
+                                        let j = 0;
+                                        j < output_details.length;
+                                        j++
+                                    ) {
+                                        const output = output_details[j];
+                                        if (
+                                            Number(output.amount) >=
+                                                Number(value) &&
+                                            output.address === onChainAddress
+                                        ) {
+                                            setWatchedInvoicePaid(
+                                                Number(output.amount)
+                                            );
 
-        if (implementation === 'lndhub') {
-            if (rHash) {
-                this.lnInterval = setInterval(() => {
-                    BackendUtils.getInvoices().then((response: any) => {
-                        const invoices = response.invoices;
-                        for (let i = 0; i < invoices.length; i++) {
-                            const result = new Invoice(invoices[i]);
-                            if (
-                                result.getFormattedRhash === rHash &&
-                                result.ispaid &&
-                                Number(result.amt) >= Number(value) &&
-                                Number(result.amt) !== 0
-                            ) {
-                                setWatchedInvoicePaid(result.amt);
-                                if (orderId) {
-                                    PosStore.recordPayment({
-                                        orderId,
-                                        orderTotal,
-                                        orderTip,
-                                        exchangeRate,
-                                        rate,
-                                        type: 'ln',
-                                        tx: result.payment_request,
-                                        preimage: result.r_preimage
-                                    });
-                                    // Clear stored invoice after successful payment
-                                    PosStore.clearOrderInvoice(orderId);
+                                            if (orderId) {
+                                                PosStore.recordPayment({
+                                                    orderId,
+                                                    orderTotal,
+                                                    orderTip,
+                                                    exchangeRate,
+                                                    rate,
+                                                    type: 'onchain',
+                                                    tx: result.tx_hash
+                                                });
+                                                // Clear stored invoice after successful payment
+                                                PosStore.clearOrderInvoice(
+                                                    orderId
+                                                );
+                                            }
+                                            this.clearIntervals();
+                                            // break parent loop
+                                            i = txs.length;
+                                            break;
+                                        }
+                                    }
                                 }
-                                this.clearIntervals();
-                                break;
                             }
-                        }
-                    });
-                }, 5000);
+                        })
+                        .catch(console.error);
+                }, 7000);
             }
         }
     };
